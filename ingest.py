@@ -5,6 +5,8 @@ Safe to re-run: chunk IDs are deterministic, so re-ingestion upserts rather
 than duplicating rows.
 """
 
+from __future__ import annotations
+
 import re
 import sys
 
@@ -15,9 +17,18 @@ from sentence_transformers import SentenceTransformer
 import config
 
 
+def _pages_from_doc(doc) -> list[tuple[int, str]]:
+    return [(i + 1, doc[i].get_text("text")) for i in range(len(doc))]
+
+
 def extract_pages(pdf_path) -> list[tuple[int, str]]:
     doc = fitz.open(pdf_path)
-    return [(i + 1, doc[i].get_text("text")) for i in range(len(doc))]
+    return _pages_from_doc(doc)
+
+
+def extract_pages_from_bytes(pdf_bytes: bytes) -> list[tuple[int, str]]:
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    return _pages_from_doc(doc)
 
 
 def chunk_page_text(text: str, chunk_size: int, overlap: int) -> list[str]:
@@ -61,7 +72,7 @@ def chunk_page_text(text: str, chunk_size: int, overlap: int) -> list[str]:
     return overlapped
 
 
-def build_chunks(pages: list[tuple[int, str]]) -> tuple[list[str], list[str], list[dict]]:
+def build_chunks(pages: list[tuple[int, str]], source_name: str) -> tuple[list[str], list[str], list[dict]]:
     ids, documents, metadatas = [], [], []
     for page_num, page_text in pages:
         page_chunks = chunk_page_text(page_text, config.CHUNK_SIZE, config.CHUNK_OVERLAP)
@@ -70,12 +81,41 @@ def build_chunks(pages: list[tuple[int, str]]) -> tuple[list[str], list[str], li
             documents.append(chunk)
             metadatas.append(
                 {
-                    "source_file": config.PDF_PATH.name,
+                    "source_file": source_name,
                     "page": page_num,
                     "chunk_index": idx,
                 }
             )
     return ids, documents, metadatas
+
+
+def ingest_pages(pages: list[tuple[int, str]], source_name: str, embedder: SentenceTransformer | None = None) -> dict:
+    """Chunk, embed, and store pages in Chroma. Shared by the CLI entry point
+    below and the Streamlit app's PDF-upload flow. Returns a small summary
+    dict (page/chunk counts) for the caller to report back."""
+    ids, documents, metadatas = build_chunks(pages, source_name)
+
+    if embedder is None:
+        embedder = SentenceTransformer(config.EMBEDDING_MODEL_NAME)
+
+    embeddings = embedder.encode(
+        documents, batch_size=32, show_progress_bar=False, normalize_embeddings=True
+    ).tolist()
+
+    client = chromadb.PersistentClient(path=config.CHROMA_DB_PATH)
+    collection = client.get_or_create_collection(
+        name=config.COLLECTION_NAME,
+        metadata={"hnsw:space": "cosine"},
+    )
+    collection.upsert(ids=ids, documents=documents, embeddings=embeddings, metadatas=metadatas)
+
+    return {
+        "pages": len(pages),
+        "chunks": len(documents),
+        "sample_id": ids[0] if ids else None,
+        "sample_metadata": metadatas[0] if metadatas else None,
+        "sample_text": documents[0][:300] if documents else None,
+    }
 
 
 def main() -> None:
@@ -88,32 +128,17 @@ def main() -> None:
     pages = extract_pages(config.PDF_PATH)
     print(f"Extracted {len(pages)} pages.")
 
-    ids, documents, metadatas = build_chunks(pages)
-    print(f"Built {len(documents)} chunks.")
-
     print(f"Loading embedding model '{config.EMBEDDING_MODEL_NAME}' (first run downloads it)...")
-    embedder = SentenceTransformer(config.EMBEDDING_MODEL_NAME)
-
-    print("Embedding chunks...")
-    embeddings = embedder.encode(
-        documents, batch_size=32, show_progress_bar=True, normalize_embeddings=True
-    ).tolist()
-
-    client = chromadb.PersistentClient(path=config.CHROMA_DB_PATH)
-    collection = client.get_or_create_collection(
-        name=config.COLLECTION_NAME,
-        metadata={"hnsw:space": "cosine"},
-    )
-
-    collection.upsert(ids=ids, documents=documents, embeddings=embeddings, metadatas=metadatas)
+    print("Embedding and storing chunks...")
+    result = ingest_pages(pages, config.PDF_PATH.name)
 
     print()
     print("--- Sample chunk ---")
-    print(f"id: {ids[0]}")
-    print(f"metadata: {metadatas[0]}")
-    print(f"text: {documents[0][:300]}...")
+    print(f"id: {result['sample_id']}")
+    print(f"metadata: {result['sample_metadata']}")
+    print(f"text: {result['sample_text']}...")
     print()
-    print(f"Stored {len(documents)} chunks in collection '{config.COLLECTION_NAME}' at {config.CHROMA_DB_PATH}")
+    print(f"Stored {result['chunks']} chunks in collection '{config.COLLECTION_NAME}' at {config.CHROMA_DB_PATH}")
 
 
 if __name__ == "__main__":

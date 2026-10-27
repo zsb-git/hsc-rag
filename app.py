@@ -1,10 +1,18 @@
+import os
+
 import streamlit as st
 from dotenv import load_dotenv
 
 import config
+import ingest
 import rag
 
 load_dotenv()
+
+# On Streamlit Community Cloud the key lives in st.secrets (set via the app's
+# "Secrets" panel); locally it comes from .env via load_dotenv() above.
+if not os.environ.get("ANTHROPIC_API_KEY") and "ANTHROPIC_API_KEY" in st.secrets:
+    os.environ["ANTHROPIC_API_KEY"] = st.secrets["ANTHROPIC_API_KEY"]
 
 st.set_page_config(page_title="HSC Economics — Topic 1 Chat", page_icon="📘")
 
@@ -26,6 +34,19 @@ def cached_anthropic_client():
 
 st.title("📘 HSC Economics — Topic 1 Chat")
 st.caption(f"Ask questions about: {config.CHAPTER_TITLE}")
+
+collection = cached_collection()
+
+if collection.count() == 0:
+    st.info("No study material loaded yet. Upload the chapter PDF below to get started.")
+    uploaded_pdf = st.file_uploader("Upload PDF", type="pdf")
+    if uploaded_pdf is not None:
+        with st.spinner("Reading and indexing the PDF... this happens once."):
+            pages = ingest.extract_pages_from_bytes(uploaded_pdf.getvalue())
+            result = ingest.ingest_pages(pages, uploaded_pdf.name, embedder=cached_embedder())
+        st.success(f"Indexed {result['chunks']} chunks from {result['pages']} pages. Loading chat...")
+        st.rerun()
+    st.stop()
 
 if "messages" not in st.session_state:
     st.session_state.messages = []
